@@ -13,12 +13,9 @@ import (
 	_ "k8s.io/apimachinery/pkg/util/json"
 
 	"github.com/golang/glog"
+
 	"github.com/kubernetes-csi/csi-lib-utils/protosanitizer"
-
 	"github.com/kubernetes-incubator/external-storage/lib/controller"
-
-	snapapi "github.com/kubernetes-csi/external-snapshotter/pkg/apis/volumesnapshot/v1alpha1"
-	snapclientset "github.com/kubernetes-csi/external-snapshotter/pkg/client/clientset/versioned"
 
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,9 +32,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi/v0"
 	csiclientset "k8s.io/csi-api/pkg/client/clientset/versioned"
-
-	"github.com/kubernetes-csi/external-provisioner/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 )
 
 const (
@@ -62,8 +56,7 @@ const (
 
 	defaultFSType = "ext4"
 
-	snapshotKind     = "VolumeSnapshot"
-	snapshotAPIGroup = snapapi.GroupName // "snapshot.storage.k8s.io"
+	DriverName = "csi-lvm"
 )
 
 // CSIProvisioner struct
@@ -71,14 +64,12 @@ type csiProvisioner struct {
 	client               kubernetes.Interface
 	csiClient            csi.ControllerClient
 	csiAPIClient         csiclientset.Interface
-	snapshotClient       snapclientset.Interface
 	timeout              time.Duration
 	identity             string
 	volumeNamePrefix     string
 	volumeNameUUIDLength int
 	config               *rest.Config
 }
-
 
 var _ controller.Provisioner = &csiProvisioner{}
 
@@ -91,25 +82,57 @@ var (
 	provisionerIDKey = "storage.kubernetes.io/csiProvisionerIdentity"
 )
 
+// from external-attacher/pkg/connection
+//TODO consolidate ane librarize
+func logGRPC(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	glog.V(5).Infof("GRPC call: %s", method)
+	glog.V(5).Infof("GRPC request: %s", protosanitizer.StripSecretsCSI03(req))
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	glog.V(5).Infof("GRPC response: %s", protosanitizer.StripSecretsCSI03(reply))
+	glog.V(5).Infof("GRPC error: %v", err)
+	return err
+}
 
+func Connect(address string, timeout time.Duration) (*grpc.ClientConn, error) {
+	glog.V(2).Infof("Connecting to %s", address)
+	dialOptions := []grpc.DialOption{
+		grpc.WithInsecure(),
+		grpc.WithBackoffMaxDelay(time.Second),
+		grpc.WithUnaryInterceptor(logGRPC),
+	}
+	if strings.HasPrefix(address, "/") {
+		dialOptions = append(dialOptions, grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout("unix", addr, timeout)
+		}))
+	}
+	conn, err := grpc.Dial(address, dialOptions...)
+
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		if !conn.WaitForStateChange(ctx, conn.GetState()) {
+			glog.V(4).Infof("Connection timed out")
+			return conn, fmt.Errorf("Connection timed out")
+		}
+		if conn.GetState() == connectivity.Ready {
+			glog.V(3).Infof("Connected")
+			return conn, nil
+		}
+		glog.V(4).Infof("Still trying, connection is %s", conn.GetState())
+	}
+}
 
 // NewCSIProvisioner creates new CSI provisioner
-func NewCSIProvisioner(client kubernetes.Interface,
-	csiAPIClient csiclientset.Interface,
-	csiEndpoint string,
-	connectionTimeout time.Duration,
-	identity string,
-	volumeNamePrefix string,
-	volumeNameUUIDLength int,
-	grpcClient *grpc.ClientConn,
-	snapshotClient snapclientset.Interface) controller.Provisioner {
+func NewCSIProvisioner(client kubernetes.Interface, csiAPIClient csiclientset.Interface, csiEndpoint string, connectionTimeout time.Duration, identity string, volumeNamePrefix string, volumeNameUUIDLength int, grpcClient *grpc.ClientConn) controller.Provisioner {
 
 	csiClient := csi.NewControllerClient(grpcClient)
 	provisioner := &csiProvisioner{
 		client:               client,
 		csiClient:            csiClient,
 		csiAPIClient:         csiAPIClient,
-		snapshotClient:       snapshotClient,
 		timeout:              connectionTimeout,
 		identity:             identity,
 		volumeNamePrefix:     volumeNamePrefix,
@@ -140,21 +163,6 @@ func makeVolumeName(prefix, pvcUID string, volumeNameUUIDLength int) (string, er
 func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
 	if options.PVC.Spec.Selector != nil {
 		return nil, fmt.Errorf("claim Selector is not supported")
-	}
-
-	var needSnapshotSupport bool = false
-	if options.PVC.Spec.DataSource != nil {
-		// PVC.Spec.DataSource.Name is the name of the VolumeSnapshot API object
-		if options.PVC.Spec.DataSource.Name == "" {
-			return nil, fmt.Errorf("the PVC source not found for PVC %s", options.PVC.Name)
-		}
-		if options.PVC.Spec.DataSource.Kind != snapshotKind {
-			return nil, fmt.Errorf("the PVC source is not the right type. Expected %s, Got %s", snapshotKind, options.PVC.Spec.DataSource.Kind)
-		}
-		if *(options.PVC.Spec.DataSource.APIGroup) != snapshotAPIGroup {
-			return nil, fmt.Errorf("the PVC source does not belong to the right APIGroup. Expected %s, Got %s", snapshotAPIGroup, *(options.PVC.Spec.DataSource.APIGroup))
-		}
-		needSnapshotSupport = true
 	}
 
 	pvName, err := makeVolumeName(p.volumeNamePrefix, fmt.Sprintf("%s", options.PVC.ObjectMeta.UID), p.volumeNameUUIDLength)
@@ -201,14 +209,6 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 		CapacityRange: &csi.CapacityRange{
 			RequiredBytes: int64(volSizeBytes),
 		},
-	}
-
-	if needSnapshotSupport {
-		volumeContentSource, err := p.getVolumeContentSource(options)
-		if err != nil {
-			return nil, fmt.Errorf("error getting snapshot handle for snapshot %s: %v", options.PVC.Spec.DataSource.Name, err)
-		}
-		req.VolumeContentSource = volumeContentSource
 	}
 
 	glog.V(5).Infof("CreateVolumeRequest %+v", req)
@@ -330,73 +330,6 @@ func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.Persis
 	return pv, nil
 }
 
-func (p *csiProvisioner) getVolumeContentSource(options controller.VolumeOptions) (*csi.VolumeContentSource, error) {
-	snapshotObj, err := p.snapshotClient.VolumesnapshotV1alpha1().VolumeSnapshots(options.PVC.Namespace).Get(options.PVC.Spec.DataSource.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("error getting snapshot %s from api server: %v", options.PVC.Spec.DataSource.Name, err)
-	}
-	if snapshotObj.Status.Ready == false {
-		return nil, fmt.Errorf("snapshot %s is not Ready", options.PVC.Spec.DataSource.Name)
-	}
-
-	if snapshotObj.ObjectMeta.DeletionTimestamp != nil {
-		return nil, fmt.Errorf("snapshot %s is currently being deleted", options.PVC.Spec.DataSource.Name)
-	}
-	glog.V(5).Infof("VolumeSnapshot %+v", snapshotObj)
-
-	snapContentObj, err := p.snapshotClient.VolumesnapshotV1alpha1().VolumeSnapshotContents().Get(snapshotObj.Spec.SnapshotContentName, metav1.GetOptions{})
-	if err != nil {
-		glog.Warningf("error getting snapshotcontent %s for snapshot %s/%s from api server: %s", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name, err)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
-	}
-
-	if snapContentObj.Spec.VolumeSnapshotRef == nil {
-		glog.Warningf("snapshotcontent %s for snapshot %s/%s is not bound", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
-	}
-
-	if snapContentObj.Spec.VolumeSnapshotRef.UID != snapshotObj.UID || snapContentObj.Spec.VolumeSnapshotRef.Namespace != snapshotObj.Namespace || snapContentObj.Spec.VolumeSnapshotRef.Name != snapshotObj.Name {
-		glog.Warningf("snapshotcontent %s for snapshot %s/%s is bound to a different snapshot", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
-	}
-
-	if snapContentObj.Spec.VolumeSnapshotSource.CSI == nil {
-		glog.Warningf("error getting snapshot source from snapshotcontent %s for snapshot %s/%s", snapshotObj.Spec.SnapshotContentName, snapshotObj.Namespace, snapshotObj.Name)
-		return nil, fmt.Errorf("snapshot in dataSource not bound or invalid")
-	}
-
-	glog.V(5).Infof("VolumeSnapshotContent %+v", snapContentObj)
-	snapshotSource := csi.VolumeContentSource_Snapshot{
-		Snapshot: &csi.VolumeContentSource_SnapshotSource{
-			Id: snapContentObj.Spec.VolumeSnapshotSource.CSI.SnapshotHandle,
-		},
-	}
-	glog.V(5).Infof("VolumeContentSource_Snapshot %+v", snapshotSource)
-
-	if snapshotObj.Status.RestoreSize != nil {
-		capacity, exists := options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
-		if !exists {
-			return nil, fmt.Errorf("error getting capacity for PVC %s when creating snapshot %s", options.PVC.Name, snapshotObj.Name)
-		}
-		volSizeBytes := capacity.Value()
-		glog.V(5).Infof("Requested volume size is %d and snapshot size is %d for the source snapshot %s", int64(volSizeBytes), int64(snapshotObj.Status.RestoreSize.Value()), snapshotObj.Name)
-		// When restoring volume from a snapshot, the volume size should
-		// be equal to or larger than its snapshot size.
-		if int64(volSizeBytes) < int64(snapshotObj.Status.RestoreSize.Value()) {
-			return nil, fmt.Errorf("requested volume size %d is less than the size %d for the source snapshot %s", int64(volSizeBytes), int64(snapshotObj.Status.RestoreSize.Value()), snapshotObj.Name)
-		}
-		if int64(volSizeBytes) > int64(snapshotObj.Status.RestoreSize.Value()) {
-			glog.Warningf("requested volume size %d is greater than the size %d for the source snapshot %s. Volume plugin needs to handle volume expansion.", int64(volSizeBytes), int64(snapshotObj.Status.RestoreSize.Value()), snapshotObj.Name)
-		}
-	}
-
-	volumeContentSource := &csi.VolumeContentSource{
-		Type: &snapshotSource,
-	}
-
-	return volumeContentSource, nil
-}
-
 func (p *csiProvisioner) Delete(volume *v1.PersistentVolume) error {
 	if volume == nil || volume.Spec.CSI == nil {
 		return fmt.Errorf("invalid CSI PV")
@@ -427,7 +360,7 @@ func (p *csiProvisioner) Delete(volume *v1.PersistentVolume) error {
 	ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
 	defer cancel()
 
-	_, err = p.csiClient.DeleteVolume(ctx, &req)
+	_, err := p.csiClient.DeleteVolume(ctx, &req)
 
 	return err
 }
