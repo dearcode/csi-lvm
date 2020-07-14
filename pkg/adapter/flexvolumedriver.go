@@ -17,6 +17,7 @@ limitations under the License.
 package adapter
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -66,6 +67,9 @@ func NewFlexVolumeDriver(driverName, driverPath string) (*flexVolumeDriver, erro
 	}
 
 	flexDriver.capabilities = *ds.Capabilities
+
+    fmt.Printf("Capabilities:%#v", flexDriver.capabilities)
+
 
 	return flexDriver, nil
 }

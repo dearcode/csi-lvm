@@ -670,11 +670,12 @@ func (ctrl *ProvisionController) processNextClaimWorkItem() bool {
 		defer ctrl.claimQueue.Done(obj)
 		var key string
 		var ok bool
-		if key, ok = obj.(string); !ok {
+        if key, ok = obj.(string); !ok {
 			ctrl.claimQueue.Forget(obj)
 			return fmt.Errorf("expected string in workqueue but got %#v", obj)
 		}
 
+        glog.V(3).Infof("11111111111111 key:%v", key)
 		if err := ctrl.syncClaimHandler(key); err != nil {
 			if ctrl.claimQueue.NumRequeues(obj) < ctrl.failedProvisionThreshold {
 				glog.Warningf("Retrying syncing claim %q because failures %v < threshold %v", key, ctrl.claimQueue.NumRequeues(obj), ctrl.failedProvisionThreshold)
@@ -744,9 +745,11 @@ func (ctrl *ProvisionController) processNextVolumeWorkItem() bool {
 func (ctrl *ProvisionController) syncClaimHandler(key string) error {
 	claimObj, exists, err := ctrl.claims.GetByKey(key)
 	if err != nil {
+            glog.V(3).Infof("11111111111111 key:%v, err:%v", key, err)
 		return err
 	}
 	if !exists {
+            glog.V(3).Infof("11111111111111 key:%v not exists", key)
 		utilruntime.HandleError(fmt.Errorf("claim %q in work queue no longer exists", key))
 		return nil
 	}
@@ -776,9 +779,12 @@ func (ctrl *ProvisionController) syncClaim(obj interface{}) error {
 		return fmt.Errorf("expected claim but got %+v", obj)
 	}
 
+    glog.V(3).Infof("11111111111111 claim:%v shouldProvision:%v", claim, ctrl.shouldProvision(claim))
 	if ctrl.shouldProvision(claim) {
 		startTime := time.Now()
+        glog.V(3).Infof("11111111111111 claim:%v, provisionClaimOperation begin", claim)
 		err := ctrl.provisionClaimOperation(claim)
+        glog.V(3).Infof("11111111111111 claim:%v, provisionClaimOperation err:%v", claim, err)
 		ctrl.updateProvisionStats(claim, err, startTime)
 		return err
 	}
@@ -920,6 +926,7 @@ func (ctrl *ProvisionController) provisionClaimOperation(claim *v1.PersistentVol
 	operation := fmt.Sprintf("provision %q class %q", claimToClaimKey(claim), claimClass)
 	glog.Info(logOperation(operation, "started"))
 
+    glog.V(3).Infof("11111111111111 claim:%v,claimClass:%v, operation:%v", claim, claimClass, operation)
 	//  A previous doProvisionClaim may just have finished while we were waiting for
 	//  the locks. Check that PV (with deterministic name) hasn't been provisioned
 	//  yet.

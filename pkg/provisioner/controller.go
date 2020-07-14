@@ -56,7 +56,7 @@ const (
 
 	defaultFSType = "ext4"
 
-	DriverName = "csi-lvm"
+	DriverName = "jdos-lvm"
 )
 
 // CSIProvisioner struct
@@ -161,6 +161,7 @@ func makeVolumeName(prefix, pvcUID string, volumeNameUUIDLength int) (string, er
 }
 
 func (p *csiProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
+	glog.V(5).Infof("###### Provision options:%#v", options)
 	if options.PVC.Spec.Selector != nil {
 		return nil, fmt.Errorf("claim Selector is not supported")
 	}

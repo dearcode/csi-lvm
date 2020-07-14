@@ -70,18 +70,16 @@ func (d *CSIDriver) ValidateControllerServiceRequest(c csi.ControllerServiceCapa
 			return nil
 		}
 	}
+
+    glog.V(3).Infof("ValidateControllerServiceRequest ----------------------------  c:%v", c)
 	return status.Error(codes.InvalidArgument, fmt.Sprintf("%s", c))
 }
 
 func (d *CSIDriver) AddControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) {
-	var csc []*csi.ControllerServiceCapability
-
 	for _, c := range cl {
 		glog.Infof("Enabling controller service capability: %v", c.String())
-		csc = append(csc, NewControllerServiceCapability(c))
+		d.cap = append(d.cap, NewControllerServiceCapability(c))
 	}
-
-	d.cap = csc
 
 	return
 }
